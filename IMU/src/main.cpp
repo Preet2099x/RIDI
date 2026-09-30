@@ -637,11 +637,30 @@ void loop() {
   static uint32_t overrunCount = 0, saturationCount = 0;
   static int maxBatch = 0;
 
+  // Stream mode for RIDI: 'S' starts a 200 Hz CSV stream, 'P' returns to the
+  // 10 Hz text output. While streaming the magnetometer is left out of the
+  // fusion, so heading comes from the gyro alone and indoor magnetic
+  // disturbance can't bend the path. RIDI doesn't need a compass heading.
+  static bool streaming = false;
+  static uint32_t lastStreamUs = 0;
+  static float gSum[3] = {0, 0, 0};
+  static int gSumN = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'S') {
+      streaming = true;
+      lastStreamUs = micros();
+      gSumN = 0;
+    } else if (c == 'P') {
+      streaming = false;
+    }
+  }
+
   uint32_t nowUs = micros();
   if (nowUs - lastAccelUs >= ACCEL_READ_INTERVAL_US) {
     lastAccelUs = nowUs;
     accelValid = readAccelG(ax, ay, az);
-    magValid = useMagInFusion && readMag(mx, my, mz);
+    magValid = useMagInFusion && !streaming && readMag(mx, my, mz);
   }
 
   static uint32_t lastFifoUs = 0;
@@ -680,6 +699,10 @@ void loop() {
     gx = frames[i][0] / GYR_LSB_PER_DPS - gyroBiasDps[0];
     gy = frames[i][1] / GYR_LSB_PER_DPS - gyroBiasDps[1];
     gz = frames[i][2] / GYR_LSB_PER_DPS - gyroBiasDps[2];
+    gSum[0] += gx;
+    gSum[1] += gy;
+    gSum[2] += gz;
+    gSumN++;
 
     float lpAlpha = dtSample / STILL_FILTER_TAU_S;
     gxLp += lpAlpha * (gx - gxLp);
@@ -703,6 +726,22 @@ void loop() {
                  accelValid ? ax : 0.0f, accelValid ? ay : 0.0f, accelValid ? az : 0.0f,
                  magValid ? mx : 0.0f, magValid ? my : 0.0f, magValid ? mz : 0.0f,
                  dtSample, atRest);
+  }
+
+  if (streaming) {
+    uint32_t t = micros();
+    if (t - lastStreamUs >= 5000 && gSumN > 0 && accelValid) {
+      lastStreamUs = t;
+      // Gyro is the mean of every FIFO sample since the last line (bias removed).
+      // Accel is the raw g reading; the PC side rescales and derives gravity.
+      Serial.printf("D,%lu,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%lu\n",
+                    (unsigned long)t, ax, ay, az,
+                    gSum[0] / gSumN, gSum[1] / gSumN, gSum[2] / gSumN,
+                    q0, q1, q2, q3, (unsigned long)overrunCount);
+      gSum[0] = gSum[1] = gSum[2] = 0.0f;
+      gSumN = 0;
+    }
+    return;
   }
 
   if (millis() - lastPrintMs >= PRINT_INTERVAL_MS) {
